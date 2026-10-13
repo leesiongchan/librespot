@@ -1903,6 +1903,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
+ "tower-service",
  "url",
  "uuid",
  "vergen",
