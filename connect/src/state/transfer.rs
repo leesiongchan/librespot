@@ -113,7 +113,7 @@ impl ConnectState {
         };
 
         self.clear_prev_track();
-        self.clear_next_tracks();
+        self.player_mut().next_tracks.clear();
         self.update_queue_revision()
     }
 
@@ -124,11 +124,10 @@ impl ConnectState {
             Some(track) => track.clone(),
         };
 
-        let context_ty = if self.current_track(|t| t.is_from_autoplay()) {
-            ContextType::Autoplay
-        } else {
-            ContextType::Default
-        };
+        let context_ty = ContextType::for_track(&track);
+        if self.get_context(context_ty)?.tracks.is_empty() {
+            Err(StateError::ContextHasNoTracks)?;
+        }
 
         self.set_active_context(context_ty);
         self.fill_up_context = context_ty;
@@ -138,7 +137,8 @@ impl ConnectState {
         let current_index = match transfer.current_session.current_uid.as_ref() {
             Some(uid) if track.is_queue() => Self::find_index_in_context(ctx, |c| &c.uid == uid)
                 .map(|i| if i > 0 { i - 1 } else { i }),
-            _ => Self::find_index_in_context(ctx, |c| c.uri == track.uri || c.uid == track.uid),
+            _ => Self::find_index_in_context(ctx, |c| !track.uid.is_empty() && c.uid == track.uid)
+                .or_else(|_| Self::find_index_in_context(ctx, |c| c.uri == track.uri)),
         };
 
         debug!(
@@ -147,6 +147,14 @@ impl ConnectState {
             self.active_context,
             ctx.tracks.len()
         );
+
+        // Keep future additions distinct from imported queue occurrences.
+        self.reserve_queue_uid(&track.uid);
+        for queued in &transfer.queue.tracks {
+            if let Some(uid) = queued.uid.as_deref() {
+                self.reserve_queue_uid(uid);
+            }
+        }
 
         if self.player().track.is_none() {
             self.set_track(track);
@@ -176,20 +184,32 @@ impl ConnectState {
                 None,
                 Some(Provider::Queue),
             ) {
-                self.add_to_queue(queued_track, false);
+                self.insert_queue_track(queued_track, false);
             }
         }
 
-        if self.shuffling_context() {
-            self.set_current_track(current_index.unwrap_or_default())?;
+        if self.shuffling_context() && context_ty == ContextType::Default {
+            if !self.current_track(|track| track.is_queue()) {
+                if let Some(current_index) = current_index {
+                    self.set_current_track(current_index)?;
+                }
+            }
             self.set_shuffle(true);
 
             match self.transfer_shuffle.take() {
                 None => self.shuffle_new(),
                 Some(state) => self.shuffle_restore(state),
             }?
+        } else if let Some(current_index) = current_index {
+            self.reset_playback_to_position(Some(current_index))?;
         } else {
-            self.reset_playback_to_position(current_index)?;
+            // Autoplay responses can start after the transferred current occurrence.
+            // Keep that occurrence and use the returned context only for continuation.
+            self.player_mut().index = MessageField::none();
+            self.update_context_index(context_ty, 0)?;
+            self.clear_prev_track();
+            self.clear_next_tracks();
+            self.fill_up_next_tracks()?;
         }
 
         self.update_restrictions();

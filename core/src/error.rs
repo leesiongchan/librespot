@@ -27,6 +27,39 @@ pub struct Error {
     pub error: Box<dyn error::Error + Send + Sync>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationFailure {
+    InvalidCredentials,
+    PremiumRequired,
+}
+
+impl Error {
+    pub fn authentication_failure(&self) -> Option<AuthenticationFailure> {
+        use crate::connection::AuthenticationError;
+        use crate::protocol::{keyexchange::ErrorCode, login5::LoginError};
+        if let Some(AuthenticationError::LoginFailed(code)) =
+            self.error.downcast_ref::<AuthenticationError>()
+        {
+            return match code {
+                ErrorCode::PremiumAccountRequired => Some(AuthenticationFailure::PremiumRequired),
+                ErrorCode::BadCredentials | ErrorCode::CouldNotValidateCredentials => {
+                    Some(AuthenticationFailure::InvalidCredentials)
+                }
+                _ => None,
+            };
+        }
+        if matches!(
+            self.error.downcast_ref::<crate::login5::Login5Error>(),
+            Some(crate::login5::Login5Error::FaultyRequest(
+                LoginError::INVALID_CREDENTIALS
+            ))
+        ) {
+            return Some(AuthenticationFailure::InvalidCredentials);
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ErrorKind {
     #[error("The operation was cancelled by the caller")]

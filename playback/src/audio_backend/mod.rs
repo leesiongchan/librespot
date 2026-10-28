@@ -1,6 +1,7 @@
 use crate::config::AudioFormat;
 use crate::convert::Converter;
 use crate::decoder::AudioPacket;
+use std::sync::{Arc, atomic::AtomicBool};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -24,6 +25,8 @@ pub trait Open {
 }
 
 pub trait Sink {
+    /// Allows teardown to interrupt an output wait before joining the player thread.
+    fn set_shutdown_signal(&mut self, _shutdown: Arc<AtomicBool>) {}
     fn start(&mut self) -> SinkResult<()> {
         Ok(())
     }
@@ -109,6 +112,8 @@ use self::gstreamer::GstreamerSink;
 mod rodio;
 #[cfg(feature = "rodio-backend")]
 use self::rodio::RodioSink;
+#[cfg(feature = "rodio-backend")]
+pub use self::rodio::mk_rodio_with_error_signal;
 
 #[cfg(feature = "sdl-backend")]
 mod sdl;

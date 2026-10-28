@@ -30,7 +30,7 @@ component! {
 }
 
 #[derive(Debug, Error)]
-enum Login5Error {
+pub(crate) enum Login5Error {
     #[error("Login request was denied: {0:?}")]
     FaultyRequest(LoginError),
     #[error("Code challenge is not supported")]
@@ -49,9 +49,8 @@ impl From<Login5Error> for Error {
             Login5Error::NoStoredCredentials | Login5Error::OnlyForMobile => {
                 Error::unavailable(err)
             }
-            Login5Error::RetriesFailed(_) | Login5Error::FaultyRequest(_) => {
-                Error::failed_precondition(err)
-            }
+            Login5Error::RetriesFailed(_) => Error::unavailable(err),
+            Login5Error::FaultyRequest(_) => Error::failed_precondition(err),
             Login5Error::CodeChallenge => Error::unimplemented(err),
         }
     }

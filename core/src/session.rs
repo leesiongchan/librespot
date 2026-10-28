@@ -37,7 +37,7 @@ use pin_project_lite::pin_project;
 use quick_xml::events::Event;
 use thiserror::Error;
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, watch},
     time::{Duration as TokioDuration, Instant as TokioInstant, Sleep, sleep},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -100,6 +100,7 @@ struct SessionData {
 struct SessionInternal {
     config: SessionConfig,
     data: RwLock<SessionData>,
+    invalidated: watch::Sender<bool>,
 
     http_client: HttpClient,
     tx_connection: OnceLock<mpsc::UnboundedSender<(u8, Vec<u8>)>>,
@@ -145,6 +146,7 @@ impl Session {
         Self(Arc::new(SessionInternal {
             config,
             data: RwLock::new(session_data),
+            invalidated: watch::channel(false).0,
             http_client,
             tx_connection: OnceLock::new(),
             cache: cache.map(Arc::new),
@@ -273,6 +275,7 @@ impl Session {
         let session_weak = self.weak();
         tokio::spawn(async move {
             if let Err(e) = sender_task.await {
+                warn!(target: "bopify_core::session", "session: transport_failed cause=ap_send_error io_kind={:?}", e.kind());
                 error!("{e}");
                 if let Some(session) = session_weak.try_upgrade() {
                     if !session.is_invalid() {
@@ -638,8 +641,15 @@ impl Session {
     pub fn shutdown(&self) {
         debug!("Shutdown: Invalidating session");
         self.0.data.write().expect(SESSION_DATA_POISON_MSG).invalid = true;
+        self.0.invalidated.send_replace(true);
         self.mercury().shutdown();
         self.channel().shutdown();
+    }
+
+    /// Waits for invalidation, including shutdown before this wait began.
+    pub async fn invalidated(&self) {
+        let mut invalidated = self.0.invalidated.subscribe();
+        let _ = invalidated.wait_for(|invalid| *invalid).await;
     }
 
     pub fn is_invalid(&self) -> bool {
@@ -820,7 +830,7 @@ where
                 loop {
                     match reader.read_event_into(&mut buf) {
                         Ok(Event::Start(ref element)) => {
-                            std::str::from_utf8(element)?.clone_into(&mut current_element)
+                            element.as_ref().clone_into(&mut current_element)
                         }
                         Ok(Event::End(_)) => {
                             current_element = String::new();
@@ -829,7 +839,7 @@ where
                             if !current_element.is_empty() {
                                 let _ = user_attributes.insert(
                                     current_element.clone(),
-                                    value.xml_content()?.to_string(),
+                                    value.xml11_content().to_string(),
                                 );
                             }
                         }
@@ -892,11 +902,13 @@ where
                     }
                 }
                 Poll::Ready(None) => {
+                    warn!(target: "bopify_core::session", "session: transport_failed cause=ap_eof");
                     warn!("Connection to server closed.");
                     session.shutdown();
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    warn!(target: "bopify_core::session", "session: transport_failed cause=ap_read_error io_kind={:?}", e.kind());
                     error!("Connection to server closed.");
                     session.shutdown();
                     return Poll::Ready(Err(e));
@@ -926,6 +938,7 @@ where
         if let Poll::Ready(()) = this.timeout.as_mut().poll(cx) {
             match this.keep_alive_state {
                 ExpectingPing | ExpectingPongAck => {
+                    warn!(target: "bopify_core::session", "session: transport_failed cause=keepalive_timeout state={:?}", this.keep_alive_state);
                     if !session.is_invalid() {
                         session.shutdown();
                     }
@@ -954,4 +967,86 @@ where
 
         Poll::Pending
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn product_info_dispatch_preserves_attributes_and_xml11_text() {
+        let session = Session::new(SessionConfig::default(), None);
+        session.set_user_attribute("stale", "old");
+        let stream = futures_util::stream::empty::<Result<(u8, Bytes), io::Error>>();
+        let mut dispatch = Box::pin(DispatchTask::new(session.weak(), stream));
+        let xml = "<products><type>premium</type><label>café\r\nA\u{85}B\u{2028}C</label><flag source=\"ap\">true</flag></products>";
+
+        dispatch
+            .as_mut()
+            .dispatch(&session, PacketType::ProductInfo as u8, Bytes::from(xml))
+            .unwrap();
+
+        assert_eq!(
+            session.get_user_attribute("type").as_deref(),
+            Some("premium")
+        );
+        assert_eq!(
+            session.get_user_attribute("label").as_deref(),
+            Some("café\nA\nB\nC")
+        );
+        assert_eq!(
+            session.get_user_attribute("flag source=\"ap\"").as_deref(),
+            Some("true")
+        );
+        assert_eq!(session.get_user_attribute("stale"), None);
+    }
+
+    struct ShutdownWake(std::sync::atomic::AtomicBool);
+    impl std::task::Wake for ShutdownWake {
+        fn wake(self: Arc<Self>) { self.wake_by_ref(); }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_retains_prior_invalidation_and_is_session_scoped() {
+        let session = Session::new(SessionConfig::default(), None);
+        let waiting = session.invalidated();
+        session.shutdown();
+        waiting.await;
+        session.invalidated().await;
+        session.shutdown();
+        session.invalidated().await;
+
+        let fresh = Session::new(SessionConfig::default(), None);
+        let mut waiting = Box::pin(fresh.invalidated());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_wakes_all_waiters_after_cancellation() {
+        let session = Session::new(SessionConfig::default(), None);
+        let mut cancelled = Box::pin(session.invalidated());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        drop(cancelled);
+
+        let wakeups: Vec<_> = (0..3).map(|_| Arc::new(ShutdownWake(false.into()))).collect();
+        let mut waiting: Vec<_> = (0..3).map(|_| Box::pin(session.invalidated())).collect();
+        for (future, wakeup) in waiting.iter_mut().zip(&wakeups) {
+            let waker = std::task::Waker::from(wakeup.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+        }
+        session.shutdown();
+        for (future, wakeup) in waiting.iter_mut().zip(&wakeups) {
+            assert!(wakeup.0.load(std::sync::atomic::Ordering::SeqCst));
+            let waker = std::task::Waker::from(wakeup.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(future.as_mut().poll(&mut cx).is_ready());
+        }
+    }
+
 }

@@ -1,0 +1,36 @@
+name: Bopify native regression tests
+
+on:
+  push:
+    branches: [bopify]
+  pull_request:
+    branches: [bopify]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: '1.99.1'
+      MACOSX_DEPLOYMENT_TARGET: '26.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Test libraries
+        run: >-
+          cargo test --locked --lib
+          -p librespot-core -p librespot-connect -p librespot-playback
+          --features librespot-playback/rodio-backend
+      - name: Test documentation
+        run: >-
+          cargo test --locked --doc
+          -p librespot-core -p librespot-connect -p librespot-playback
+          --features librespot-playback/rodio-backend
