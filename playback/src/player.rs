@@ -10,7 +10,7 @@ use std::{
     sync::Mutex,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     thread,
@@ -56,6 +56,7 @@ pub type PlayerResult = Result<(), Error>;
 
 pub struct Player {
     commands: Option<mpsc::UnboundedSender<PlayerCommand>>,
+    shutdown: Arc<AtomicBool>,
     thread_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -72,6 +73,7 @@ struct PlayerInternal {
     session: Session,
     config: PlayerConfig,
     commands: mpsc::UnboundedReceiver<PlayerCommand>,
+    shutdown: Arc<AtomicBool>,
     load_handles: Arc<Mutex<HashMap<thread::ThreadId, thread::JoinHandle<()>>>>,
 
     state: PlayerState,
@@ -120,6 +122,7 @@ enum PlayerCommand {
     EmitSessionDisconnectedEvent {
         connection_id: String,
         user_name: String,
+        connection_lost: bool,
     },
     EmitSessionConnectedEvent {
         connection_id: String,
@@ -139,11 +142,16 @@ enum PlayerCommand {
     },
     EmitAutoPlayChangedEvent(bool),
     EmitSetQueueEvent {
+        generation: u64,
         context_uri: String,
         current_track: Option<QueueTrack>,
         next_tracks: Vec<QueueTrack>,
         prev_tracks: Vec<QueueTrack>,
     },
+    EmitStartupResolvedEvent(StartupOutcome),
+    EmitRecoveryIdentity(RecoveryIdentity),
+    EmitConnectionReady(ConnectionOutcome),
+    EmitRemotePlaybackEvent(Option<RemoteState>),
 }
 
 /// Represents a track in the queue with its URI and provider.
@@ -151,6 +159,58 @@ enum PlayerCommand {
 pub struct QueueTrack {
     pub uri: String,
     pub provider: String,
+    pub uid: String,
+    pub id: u64,
+    pub raw_next_index: Option<u32>,
+}
+
+/// Native track occurrence used to validate automatic recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryIdentity {
+    pub track_uri: String,
+    pub track_uid: Option<String>,
+    pub context_uri: Option<String>,
+}
+
+/// Registration or local playback confirmed by Spirc's bootstrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionOutcome {
+    Local(RecoveryIdentity),
+    Remote,
+    Unavailable,
+}
+
+/// What `Spirc` did with the account's last session when its first connect
+/// cluster arrived. Emitted once, and only when `ConnectConfig::startup_restore` is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartupOutcome {
+    /// The last session was taken over, paused.
+    Restored,
+    /// Nothing was restorable, so the user's Liked Songs were loaded, paused.
+    LikedSongs,
+    /// Another device is playing; this device stayed inactive.
+    Remote {
+        /// That device's name, as Spotify's device picker shows it.
+        device_name: String,
+    },
+    /// Liked Songs could not be loaded either; the device is active and empty.
+    Nothing,
+}
+
+/// What another Connect device is playing, mirrored while this device is
+/// inactive. Emitted only when `ConnectConfig::startup_restore` is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteState {
+    /// The device's name, as Spotify's device picker shows it.
+    pub device_name: String,
+    /// The playing track's URI.
+    pub track_uri: String,
+    /// False while the device is paused.
+    pub is_playing: bool,
+    /// The position as of the cluster's server timestamp.
+    pub position_ms: u32,
+    /// The track's duration, as the device reported it.
+    pub duration_ms: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +301,7 @@ pub enum PlayerEvent {
     SessionDisconnected {
         connection_id: String,
         user_name: String,
+        connection_lost: bool,
     },
     SessionClientChanged {
         client_id: String,
@@ -263,10 +324,25 @@ pub enum PlayerEvent {
     },
     /// Fired when the queue is set or context is loaded with its track list.
     SetQueue {
+        generation: u64,
         context_uri: String,
         current_track: Option<QueueTrack>,
         next_tracks: Vec<QueueTrack>,
         prev_tracks: Vec<QueueTrack>,
+    },
+    RecoveryIdentity {
+        identity: RecoveryIdentity,
+    },
+    ConnectionReady {
+        outcome: ConnectionOutcome,
+    },
+    /// Fired once, after the connect-time startup decision.
+    StartupResolved {
+        outcome: StartupOutcome,
+    },
+    /// Fired when a mirrored device's playback changes; `None` once no other device plays.
+    RemotePlayback {
+        remote: Option<RemoteState>,
     },
 }
 
@@ -463,6 +539,8 @@ impl Player {
         F: FnOnce() -> Box<dyn Sink> + Send + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let sink_shutdown = shutdown.clone();
 
         if config.normalisation {
             debug!("Normalisation Type: {:?}", config.normalisation_type);
@@ -502,16 +580,19 @@ impl Player {
             // must be created for any new local files to be playable.
             let local_file_lookup =
                 create_local_file_lookup(config.local_file_directories.as_slice());
+            let mut sink = sink_builder();
+            sink.set_shutdown_signal(sink_shutdown.clone());
 
             let internal = PlayerInternal {
                 session,
                 config,
                 commands: cmd_rx,
+                shutdown: sink_shutdown,
                 load_handles: Arc::new(Mutex::new(HashMap::new())),
 
                 state: PlayerState::Stopped,
                 preload: PlayerPreload::None,
-                sink: sink_builder(),
+                sink,
                 sink_status: SinkStatus::Closed,
                 sink_event_callback: None,
                 volume_getter,
@@ -542,6 +623,7 @@ impl Player {
 
         Arc::new(Self {
             commands: Some(cmd_tx),
+            shutdown,
             thread_handle: Some(handle),
         })
     }
@@ -634,10 +716,16 @@ impl Player {
         });
     }
 
-    pub fn emit_session_disconnected_event(&self, connection_id: String, user_name: String) {
+    pub fn emit_session_disconnected_event(
+        &self,
+        connection_id: String,
+        user_name: String,
+        connection_lost: bool,
+    ) {
         self.command(PlayerCommand::EmitSessionDisconnectedEvent {
             connection_id,
             user_name,
+            connection_lost,
         });
     }
 
@@ -670,23 +758,44 @@ impl Player {
 
     pub fn emit_set_queue_event(
         &self,
+        generation: u64,
         context_uri: String,
         current_track: Option<QueueTrack>,
         next_tracks: Vec<QueueTrack>,
         prev_tracks: Vec<QueueTrack>,
     ) {
         self.command(PlayerCommand::EmitSetQueueEvent {
+            generation,
             context_uri,
             current_track,
             next_tracks,
             prev_tracks,
         });
     }
+
+    pub fn emit_recovery_identity(&self, identity: RecoveryIdentity) {
+        self.command(PlayerCommand::EmitRecoveryIdentity(identity));
+    }
+
+    pub fn emit_connection_ready(&self, outcome: ConnectionOutcome) {
+        self.command(PlayerCommand::EmitConnectionReady(outcome));
+    }
+
+    pub fn emit_startup_resolved_event(&self, outcome: StartupOutcome) {
+        self.command(PlayerCommand::EmitStartupResolvedEvent(outcome));
+    }
+
+    /// Emits the mirrored device's playback, or `None` once no other device plays.
+    pub fn emit_remote_playback_event(&self, remote: Option<RemoteState>) {
+        self.command(PlayerCommand::EmitRemotePlaybackEvent(remote));
+    }
 }
 
 impl Drop for Player {
     fn drop(&mut self) {
         debug!("Shutting down player thread ...");
+        // Closing commands alone cannot release a sink waiting for suspended audio output.
+        self.shutdown.store(true, Ordering::Release);
         self.commands = None;
         if let Some(handle) = self.thread_handle.take() {
             if let Err(e) = handle.join() {
@@ -1357,6 +1466,10 @@ impl Future for PlayerInternal {
         let passthrough = self.config.passthrough;
 
         loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                self.ensure_sink_stopped(false);
+                return Poll::Ready(());
+            }
             let mut all_futures_completed_or_not_ready = true;
 
             // process commands that were sent to us
@@ -2361,9 +2474,11 @@ impl PlayerInternal {
             PlayerCommand::EmitSessionDisconnectedEvent {
                 connection_id,
                 user_name,
+                connection_lost,
             } => self.send_event(PlayerEvent::SessionDisconnected {
                 connection_id,
                 user_name,
+                connection_lost,
             }),
 
             PlayerCommand::SetAutoNormaliseAsAlbum(setting) => {
@@ -2371,16 +2486,32 @@ impl PlayerInternal {
             }
 
             PlayerCommand::EmitSetQueueEvent {
+                generation,
                 context_uri,
                 current_track,
                 next_tracks,
                 prev_tracks,
             } => self.send_event(PlayerEvent::SetQueue {
+                generation,
                 context_uri,
                 current_track,
                 next_tracks,
                 prev_tracks,
             }),
+
+            PlayerCommand::EmitRecoveryIdentity(identity) => {
+                self.send_event(PlayerEvent::RecoveryIdentity { identity })
+            }
+            PlayerCommand::EmitConnectionReady(outcome) => {
+                self.send_event(PlayerEvent::ConnectionReady { outcome })
+            }
+            PlayerCommand::EmitStartupResolvedEvent(outcome) => {
+                self.send_event(PlayerEvent::StartupResolved { outcome })
+            }
+
+            PlayerCommand::EmitRemotePlaybackEvent(remote) => {
+                self.send_event(PlayerEvent::RemotePlayback { remote })
+            }
 
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => {
                 self.send_event(PlayerEvent::FilterExplicitContentChanged { filter });
@@ -2440,13 +2571,28 @@ impl PlayerInternal {
             local_file_lookup: self.local_file_lookup.clone(),
         };
 
-        let (result_tx, result_rx) = oneshot::channel();
+        self.spawn_loader(async move { loader.load_track(spotify_uri, position_ms).await })
+    }
+
+    fn spawn_loader(
+        &mut self,
+        load: impl Future<Output = Option<PlayerLoadedTrackData>> + Send + 'static,
+    ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send + 'static {
+        let (mut result_tx, result_rx) = oneshot::channel();
 
         let load_handles_clone = self.load_handles.clone();
         let handle = tokio::runtime::Handle::current();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
+            let data = handle.block_on(async {
+                match future::select(Box::pin(result_tx.closed()), Box::pin(load)).await {
+                    future::Either::Left(_) => {
+                        debug!("Abandoned track load cancelled");
+                        None
+                    }
+                    future::Either::Right((data, _)) => data,
+                }
+            });
             if let Some(data) = data {
                 let _ = result_tx.send(data);
             }
@@ -2487,6 +2633,10 @@ impl PlayerInternal {
 impl Drop for PlayerInternal {
     fn drop(&mut self) {
         debug!("drop PlayerInternal[{}]", self.player_id);
+
+        // Close result receivers before joining so pending async loads can cancel.
+        self.state = PlayerState::Stopped;
+        self.preload = PlayerPreload::None;
 
         let handles: Vec<thread::JoinHandle<()>> = {
             // waiting for the thread while holding the mutex would result in a deadlock
@@ -2553,10 +2703,12 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::EmitSessionDisconnectedEvent {
                 connection_id,
                 user_name,
+                connection_lost,
             } => f
                 .debug_tuple("EmitSessionDisconnectedEvent")
                 .field(&connection_id)
                 .field(&user_name)
+                .field(&connection_lost)
                 .finish(),
             PlayerCommand::EmitSessionClientChangedEvent {
                 client_id,
@@ -2584,15 +2736,28 @@ impl fmt::Debug for PlayerCommand {
                 .field(&auto_play)
                 .finish(),
             PlayerCommand::EmitSetQueueEvent {
+                generation,
                 context_uri,
                 next_tracks,
                 prev_tracks,
                 ..
             } => f
                 .debug_tuple("EmitSetQueueEvent")
+                .field(generation)
                 .field(&context_uri)
                 .field(&next_tracks.len())
                 .field(&prev_tracks.len())
+                .finish(),
+            PlayerCommand::EmitRecoveryIdentity(_) => f.write_str("EmitRecoveryIdentity"),
+            PlayerCommand::EmitConnectionReady(_) => f.write_str("EmitConnectionReady"),
+            PlayerCommand::EmitStartupResolvedEvent(outcome) => f
+                .debug_tuple("EmitStartupResolvedEvent")
+                .field(&outcome)
+                .finish(),
+            // Presence only: the state carries the user's device name.
+            PlayerCommand::EmitRemotePlaybackEvent(remote) => f
+                .debug_tuple("EmitRemotePlaybackEvent")
+                .field(&remote.is_some())
                 .finish(),
         }
     }
@@ -2700,5 +2865,166 @@ where
 
     fn byte_len(&self) -> Option<u64> {
         Some(self.length)
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use crate::{audio_backend::SinkResult, mixer::NoOpVolume};
+    use std::sync::{atomic::AtomicBool, mpsc as std_mpsc};
+
+    struct IdleSink;
+    impl Sink for IdleSink {
+        fn write(&mut self, _: AudioPacket, _: &mut Converter) -> SinkResult<()> {
+            unreachable!("this idle player has no audio")
+        }
+    }
+
+    fn idle_player() -> PlayerInternal {
+        let config = PlayerConfig::default();
+        PlayerInternal {
+            session: Session::new(librespot_core::SessionConfig::default(), None),
+            commands: mpsc::unbounded_channel().1,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            load_handles: Arc::new(Mutex::new(HashMap::new())),
+            state: PlayerState::Stopped,
+            preload: PlayerPreload::None,
+            sink: Box::new(IdleSink),
+            sink_status: SinkStatus::Closed,
+            sink_event_callback: None,
+            volume_getter: Box::new(NoOpVolume),
+            event_senders: vec![],
+            converter: Converter::new(config.ditherer),
+            normalisation_integrators: [0.0; 2],
+            normalisation_peaks: [0.0; 2],
+            normalisation_channel: 0,
+            normalisation_knee_factor: 1.0 / (8.0 * config.normalisation_knee_db),
+            auto_normalise_as_album: false,
+            player_id: 0,
+            play_request_id_generator: SeqGenerator::new(0),
+            last_progress_update: Instant::now(),
+            local_file_lookup: Arc::new(create_local_file_lookup(&[])),
+            config,
+        }
+    }
+
+    async fn drop_with_stalled_loader(preload: bool) {
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = std_mpsc::channel();
+        let (drop_tx, drop_rx) = std_mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let joined = thread::spawn(move || {
+            let _guard = runtime.enter();
+            let mut player = idle_player();
+            let loader = Box::pin(player.spawn_loader(async move {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.await;
+                None
+            }));
+            let track_id = SpotifyUri::from_uri("spotify:track:5sWHDYs0csV6RS48xBl0tH").unwrap();
+            if preload {
+                player.preload = PlayerPreload::Loading { track_id, loader };
+            } else {
+                player.state = PlayerState::Loading {
+                    track_id,
+                    play_request_id: 0,
+                    start_playback: true,
+                    loader,
+                };
+            }
+            let _ = drop_rx.recv();
+            drop(player);
+            let _ = done_tx.send(());
+        });
+        let started = started_rx.recv_timeout(Duration::from_secs(1));
+        let _ = drop_tx.send(());
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        // Release the stalled future even on failure so the regression cannot hang the suite.
+        let _ = release_tx.send(());
+        joined.join().unwrap();
+        assert_eq!(started, Ok(()));
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn player_drop_cancels_stalled_track_load() {
+        drop_with_stalled_loader(false).await;
+    }
+
+    #[tokio::test]
+    async fn player_drop_cancels_stalled_preload() {
+        drop_with_stalled_loader(true).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_obsolete_loader_cancels_its_work() {
+        struct LoadGuard(std_mpsc::Sender<()>);
+        impl Drop for LoadGuard {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let mut player = idle_player();
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let loader = player.spawn_loader(async move {
+            let _guard = LoadGuard(cancelled_tx);
+            started_tx.send(()).unwrap();
+            let _ = release_rx.await;
+            None
+        });
+        let started = started_rx.recv_timeout(Duration::from_secs(1));
+        drop(loader);
+        let cancelled = cancelled_rx.recv_timeout(Duration::from_secs(1));
+        let _ = release_tx.send(());
+        drop(player);
+        assert_eq!(started, Ok(()));
+        assert_eq!(cancelled, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn failed_load_still_reaches_the_player() {
+        let mut player = idle_player();
+        let loader = player.spawn_loader(async { None });
+        assert!(loader.await.is_err());
+    }
+
+    struct ShutdownCaptureSink(std_mpsc::Sender<Arc<AtomicBool>>);
+    impl Sink for ShutdownCaptureSink {
+        fn set_shutdown_signal(&mut self, shutdown: Arc<AtomicBool>) {
+            self.0.send(shutdown.clone()).unwrap();
+            while !shutdown.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn write(&mut self, _: AudioPacket, _: &mut Converter) -> SinkResult<()> {
+            unreachable!("this idle player has no audio")
+        }
+    }
+
+    #[tokio::test]
+    async fn player_drop_signals_the_sink_before_joining() {
+        let (tx, rx) = std_mpsc::channel();
+        let player = Player::new(
+            PlayerConfig::default(),
+            Session::new(librespot_core::SessionConfig::default(), None),
+            Box::new(NoOpVolume),
+            move || Box::new(ShutdownCaptureSink(tx)),
+        );
+        let signal = rx.recv_timeout(Duration::from_secs(1));
+        let signal = signal.unwrap();
+        let (done_tx, done_rx) = std_mpsc::channel();
+        let joined = thread::spawn(move || {
+            drop(player);
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        signal.store(true, Ordering::Release);
+        joined.join().unwrap();
+        assert_eq!(result, Ok(()));
     }
 }

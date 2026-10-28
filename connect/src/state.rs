@@ -3,6 +3,7 @@ mod handle;
 mod metadata;
 mod options;
 pub(super) mod provider;
+mod recovery;
 mod restrictions;
 mod tracks;
 mod transfer;
@@ -92,6 +93,11 @@ pub struct ConnectConfig {
     pub volume_steps: u16,
     /// Emit `SetQueue` player events when the queue changes (default: false)
     pub emit_set_queue_events: bool,
+    /// Bopify: on the first connect cluster, restore the last session paused, else
+    /// load Liked Songs paused, unless another device is playing (default: false)
+    pub startup_restore: bool,
+    /// Recovery bypasses cold-launch fallback and obeys cluster ownership.
+    pub startup_mode: crate::StartupMode,
 }
 
 impl Default for ConnectConfig {
@@ -104,12 +110,17 @@ impl Default for ConnectConfig {
             disable_volume: false,
             volume_steps: 64,
             emit_set_queue_events: false,
+            startup_restore: false,
+            startup_mode: crate::StartupMode::ColdLaunch,
         }
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub(super) struct ConnectState {
+    pub queue_movement: Option<crate::queue::QueueMovement>,
+    pub queue_replaced: bool,
+    pub preserve_recovery_queue: bool,
     /// the entire state that is updated to the remote server
     request: PutStateRequest,
 
@@ -243,7 +254,7 @@ impl ConnectState {
             .expect("the request is always available")
     }
 
-    fn player_mut(&mut self) -> &mut PlayerState {
+    pub(crate) fn player_mut(&mut self) -> &mut PlayerState {
         self.device_mut()
             .player_state
             .as_mut()
@@ -471,13 +482,10 @@ impl ConnectState {
         session: &Session,
         reason: PutStateReason,
     ) -> SpClientResult {
-        let prev_reason = self.request.put_state_reason;
-
-        self.request.put_state_reason = EnumOrUnknown::new(reason);
-        let res = self.send_state(session).await;
-
-        self.request.put_state_reason = prev_reason;
-        res
+        // Keep the stored reason unchanged when a restoration deadline cancels publication.
+        let mut request = self.request.clone();
+        request.put_state_reason = EnumOrUnknown::new(reason);
+        session.spclient().put_connect_state_request(&request).await
     }
 
     /// Notifies the remote server about a new device

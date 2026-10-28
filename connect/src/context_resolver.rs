@@ -4,7 +4,7 @@ use crate::{
         autoplay_context_request::AutoplayContextRequest, context::Context,
         transfer_state::TransferState,
     },
-    state::{ConnectState, context::ContextType},
+    state::{ConnectState, StateError, context::ContextType},
 };
 use std::{
     cmp::PartialEq,
@@ -124,6 +124,8 @@ pub struct ContextResolver {
     session: Session,
     queue: VecDeque<ResolveContext>,
     unavailable_contexts: HashMap<ResolveContext, Instant>,
+    retry_at: Option<Instant>,
+    retry_used: bool,
 }
 
 // time after which an unavailable context is retried
@@ -135,6 +137,8 @@ impl ContextResolver {
             session,
             queue: VecDeque::new(),
             unavailable_contexts: HashMap::new(),
+            retry_at: None,
+            retry_used: false,
         }
     }
 
@@ -177,7 +181,27 @@ impl ContextResolver {
         }
     }
 
+    pub fn add_required(&mut self, resolve: ResolveContext) {
+        self.unavailable_contexts.remove(&resolve);
+        self.add(resolve);
+    }
+
+    pub fn next_is_required(&self, active: ContextType) -> bool {
+        matches!(self.find_next(), Some((next, _, _)) if next.update == active && next.action == ContextAction::Replace)
+    }
+
+    pub fn retry_next(&mut self) -> bool {
+        if self.retry_used || !self.has_next() {
+            return false;
+        }
+        self.retry_used = true;
+        self.retry_at = Some(Instant::now() + Duration::from_millis(250));
+        true
+    }
+
     pub fn remove_used_and_invalid(&mut self) {
+        self.retry_at = None;
+        self.retry_used = false;
         if let Some((_, _, remove)) = self.find_next() {
             let _ = self.queue.drain(0..remove); // remove invalid
         }
@@ -185,7 +209,9 @@ impl ContextResolver {
     }
 
     pub fn clear(&mut self) {
-        self.queue = VecDeque::new()
+        self.queue = VecDeque::new();
+        self.retry_at = None;
+        self.retry_used = false;
     }
 
     fn find_next(&self) -> Option<(&ResolveContext, &str, usize)> {
@@ -210,6 +236,9 @@ impl ContextResolver {
         &self,
         recent_track_uri: impl Fn() -> Vec<String>,
     ) -> Result<Context, Error> {
+        if let Some(retry_at) = self.retry_at {
+            tokio::time::sleep_until(retry_at).await;
+        }
         let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
         match next.update {
@@ -255,14 +284,18 @@ impl ContextResolver {
     ) -> Result<Option<Vec<ResolveContext>>, Error> {
         let (next, _, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
+        let mut staged = state.clone();
+        let native_queue = staged
+            .preserve_recovery_queue
+            .then(|| staged.player().clone());
         let remaining = match next.action {
-            ContextAction::Append if context.pages.len() == 1 => state
+            ContextAction::Append if context.pages.len() == 1 => staged
                 .fill_context_from_page(context.pages.remove(0))
                 .map(|_| None),
             ContextAction::Replace => {
-                let remaining = state.update_context(context, next.update);
+                let remaining = staged.update_context(context, next.update);
                 if let Resolve::Context(ref ctx) = next.resolve {
-                    state.merge_context(ctx.pages.clone().pop());
+                    staged.merge_context(ctx.pages.clone().pop());
                 }
 
                 remaining
@@ -272,6 +305,15 @@ impl ContextResolver {
                 Err(ContextResolverError::UnexpectedPagesSize(context.pages.len()).into())
             }
         }?;
+
+        if staged.get_context(next.update)?.tracks.is_empty() {
+            Err(StateError::ContextHasNoTracks)?;
+        }
+
+        if let Some(native) = native_queue {
+            staged.restore_recovery_player_state(native)?;
+        }
+        *state = staged;
 
         Ok(remaining.map(|remaining| {
             remaining
@@ -285,11 +327,31 @@ impl ContextResolver {
         &self,
         state: &mut ConnectState,
         transfer_state: &mut Option<TransferState>,
-    ) -> bool {
+    ) -> Result<bool, Error> {
         let (next, _, _) = match self.find_next() {
-            None => return false,
+            None => return Ok(false),
             Some(next) => next,
         };
+
+        if let Some(transfer) = transfer_state.as_ref() {
+            let track = match state.player().track.as_ref() {
+                Some(track) => track.clone(),
+                None => state.current_track_from_transfer(transfer)?,
+            };
+            let required = ContextType::for_track(&track);
+            if next.update != required || state.get_context(required).is_err() {
+                return Ok(false);
+            }
+            // Transfer completion can fail after queue insertion or shuffle preparation.
+            // Commit the state and consume its transfer together, only after success.
+            let mut staged = state.clone();
+            staged.finish_transfer(transfer.clone())?;
+            staged.update_restrictions();
+            staged.update_queue_revision();
+            *state = staged;
+            *transfer_state = None;
+            return Ok(true);
+        }
 
         // when there is only one update type, we are the last of our kind, so we should update the state
         if self
@@ -299,7 +361,7 @@ impl ContextResolver {
             .count()
             != 1
         {
-            return false;
+            return Ok(false);
         }
 
         match (next.update, state.active_context) {
@@ -311,36 +373,478 @@ impl ContextResolver {
             }
             (ContextType::Default, _) => {
                 debug!("skipped finishing default, because it isn't the active context");
-                return false;
+                return Ok(false);
             }
         }
 
-        let active_ctx = state.get_context(state.active_context);
-        let res = if let Some(transfer_state) = transfer_state.take() {
-            state.finish_transfer(transfer_state)
-        } else if state.shuffling_context() && next.update == ContextType::Default {
-            state.shuffle_new()
+        if state.preserve_recovery_queue {
+            return Ok(state.get_context(state.active_context).is_ok());
+        }
+        let mut staged = state.clone();
+        let active_ctx = staged.get_context(staged.active_context);
+        if staged.shuffling_context() && next.update == ContextType::Default {
+            staged.shuffle_new()?;
         } else if matches!(active_ctx, Ok(ctx) if ctx.index.track == 0) {
             // has context, and context is not touched
             // when the index is not zero, the next index was already evaluated elsewhere
             let ctx = active_ctx.expect("checked by precondition");
             let idx = ConnectState::find_index_in_context(ctx, |t| {
-                state.current_track(|c| t.uri == c.uri)
+                staged.current_track(|c| t.uri == c.uri)
             })
             .ok();
 
-            state.reset_playback_to_position(idx)
+            staged.reset_playback_to_position(idx)?;
         } else {
-            state.fill_up_next_tracks()
-        };
-
-        if let Err(why) = res {
-            error!("setup of state failed: {why}, last used resolve {next:#?}")
+            staged.fill_up_next_tracks()?;
         }
 
-        state.update_restrictions();
-        state.update_queue_revision();
+        staged.update_restrictions();
+        staged.update_queue_revision();
+        *state = staged;
+        Ok(true)
+    }
+}
 
-        true
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use crate::{
+        ConnectConfig,
+        protocol::{context_page::ContextPage, context_track::ContextTrack, playback::Playback},
+        state::provider::IsProvider,
+    };
+    use protobuf::MessageField;
+
+    const URI: &str = "spotify:track:6rqhFgbbKwnb9MLmUQDhG6";
+
+    fn track(uid: &str) -> ContextTrack {
+        ContextTrack {
+            uri: Some(URI.into()),
+            uid: Some(uid.into()),
+            ..Default::default()
+        }
+    }
+
+    fn context() -> Context {
+        Context {
+            uri: Some(URI.into()),
+            pages: vec![ContextPage {
+                tracks: vec![track("first"), track("current"), track("next")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn fixture(autoplay: bool) -> (ConnectState, ContextResolver, Option<TransferState>) {
+        let session = Session::new(crate::core::SessionConfig::default(), None);
+        let mut state = ConnectState::new(ConnectConfig::default(), &session);
+        let mut current = track("current");
+        if autoplay {
+            current
+                .metadata
+                .insert("autoplay.is_autoplay".into(), "true".into());
+        }
+        let mut transfer = TransferState {
+            playback: MessageField::some(Playback {
+                current_track: MessageField::some(current),
+                is_paused: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        transfer
+            .current_session
+            .mut_or_insert_default()
+            .context
+            .mut_or_insert_default()
+            .uri = Some(URI.into());
+        transfer
+            .queue
+            .mut_or_insert_default()
+            .tracks
+            .push(track("queued"));
+        state.set_track(state.current_track_from_transfer(&transfer).unwrap());
+        (state, ContextResolver::new(session), Some(transfer))
+    }
+
+    fn resolve(resolver: &mut ContextResolver, state: &mut ConnectState, ty: ContextType) {
+        let context = context();
+        resolver.add(ResolveContext::from_uri(
+            URI,
+            URI,
+            ty,
+            ContextAction::Replace,
+        ));
+        resolver.apply_next_context(state, context).unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_update_preserves_duplicate_occurrences_before_transfer_completion() {
+        let (mut state, mut resolver, mut transfer) = fixture(false);
+        let current = track("next");
+        transfer
+            .as_mut()
+            .unwrap()
+            .playback
+            .mut_or_insert_default()
+            .current_track = MessageField::some(current.clone());
+        state.set_track(
+            state
+                .current_track_from_transfer(transfer.as_ref().unwrap())
+                .unwrap(),
+        );
+        let context = context();
+        resolver.add(ResolveContext::from_context(
+            context.clone(),
+            ContextType::Default,
+            ContextAction::Replace,
+        ));
+        resolver.apply_next_context(&mut state, context).unwrap();
+        let uids: Vec<_> = state
+            .get_context(ContextType::Default)
+            .unwrap()
+            .tracks
+            .iter()
+            .map(|track| track.uid.as_str())
+            .collect();
+        assert_eq!(uids, ["first", "current", "next"]);
+        assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+        assert_eq!(state.player().track.uid, "next");
+        assert_eq!(state.player().index.track, 2);
+    }
+
+    #[tokio::test]
+    async fn context_updates_match_uids_then_distinct_uri_occurrences() {
+        for (incoming, expected) in [
+            (
+                [Some("next"), Some("current"), Some("first")],
+                ["first", "current", "next"],
+            ),
+            (
+                [Some("new-first"), Some("new-current"), Some("new-next")],
+                ["new-first", "new-current", "new-next"],
+            ),
+            ([Some(""), None, Some("next")], ["first", "current", "next"]),
+            (
+                [Some("new-first"), Some("first"), Some("next")],
+                ["first", "new-first", "next"],
+            ),
+        ] {
+            let (mut state, mut resolver, _) = fixture(false);
+            let mut update = context();
+            for (track, uid) in update.pages[0].tracks.iter_mut().zip(incoming) {
+                let label = uid
+                    .filter(|uid| !uid.is_empty())
+                    .or(track.uid.as_deref())
+                    .unwrap();
+                track.metadata.insert("merged_uid".into(), label.into());
+                track.uid = uid.map(str::to_owned);
+            }
+            resolver.add(ResolveContext::from_context(
+                update,
+                ContextType::Default,
+                ContextAction::Replace,
+            ));
+            resolver.apply_next_context(&mut state, context()).unwrap();
+            let uids: Vec<_> = state
+                .get_context(ContextType::Default)
+                .unwrap()
+                .tracks
+                .iter()
+                .map(|track| track.uid.as_str())
+                .collect();
+            assert_eq!(uids, expected);
+            let labels: Vec<_> = state
+                .get_context(ContextType::Default)
+                .unwrap()
+                .tracks
+                .iter()
+                .map(|track| track.metadata["merged_uid"].as_str())
+                .collect();
+            assert_eq!(labels, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_first_keeps_pending_autoplay_transfer() {
+        let (mut state, mut resolver, mut transfer) = fixture(true);
+        resolve(&mut resolver, &mut state, ContextType::Default);
+        let before = state.player().clone();
+        assert!(!resolver.try_finish(&mut state, &mut transfer).unwrap());
+        assert!(transfer.is_some());
+        assert_eq!(state.player(), &before);
+    }
+
+    #[tokio::test]
+    async fn autoplay_first_keeps_pending_default_transfer() {
+        let (mut state, mut resolver, mut transfer) = fixture(false);
+        resolve(&mut resolver, &mut state, ContextType::Autoplay);
+        assert!(!resolver.try_finish(&mut state, &mut transfer).unwrap());
+        assert!(transfer.is_some());
+    }
+
+    #[tokio::test]
+    async fn completed_transfer_preserves_occurrence_and_imports_queue_once() {
+        for autoplay in [false, true] {
+            let (mut state, mut resolver, mut transfer) = fixture(autoplay);
+            let ty = if autoplay {
+                ContextType::Autoplay
+            } else {
+                ContextType::Default
+            };
+            resolve(&mut resolver, &mut state, ty);
+            assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+            assert!(transfer.is_none());
+            assert_eq!(state.player().track.uid, "current");
+            assert_eq!(state.player().index.track, 1);
+            assert_eq!(
+                state
+                    .player()
+                    .next_tracks
+                    .iter()
+                    .filter(|t| t.is_queue())
+                    .count(),
+                1
+            );
+            assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+            assert_eq!(
+                state
+                    .player()
+                    .next_tracks
+                    .iter()
+                    .filter(|t| t.is_queue())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_preserves_queued_uids_and_reserves_future_occurrences() {
+        for autoplay in [false, true] {
+            let (mut state, mut resolver, mut transfer) = fixture(autoplay);
+            let pending = transfer.as_mut().unwrap();
+            pending.queue.mut_or_insert_default().tracks =
+                vec![track(""), track("q0"), track("external-occurrence")];
+            resolve(
+                &mut resolver,
+                &mut state,
+                if autoplay {
+                    ContextType::Autoplay
+                } else {
+                    ContextType::Default
+                },
+            );
+            assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+            let queued: Vec<_> = state
+                .player()
+                .next_tracks
+                .iter()
+                .filter(|t| t.is_queue())
+                .map(|t| t.uid.as_str())
+                .collect();
+            assert!(!queued[0].is_empty());
+            assert_ne!(queued[0], queued[1]);
+            assert_ne!(queued[0], queued[2]);
+            assert_eq!(&queued[1..], ["q0", "external-occurrence"]);
+            state.add_to_queue(state.player().track.as_ref().unwrap().clone(), true);
+            let queued: Vec<_> = state
+                .player()
+                .next_tracks
+                .iter()
+                .filter(|t| t.is_queue())
+                .map(|t| t.uid.as_str())
+                .collect();
+            assert_eq!(&queued[1..], ["q0", "external-occurrence", "q1"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_reserves_playing_queue_uid_before_new_additions() {
+        let (mut state, mut resolver, mut transfer) = fixture(false);
+        let pending = transfer.as_mut().unwrap();
+        pending.queue.mut_or_insert_default().is_playing_queue = Some(true);
+        pending.queue.mut_or_insert_default().tracks = vec![track("q8"), track("q3")];
+        pending.current_session.mut_or_insert_default().current_uid = Some("current".into());
+        state.set_track(state.current_track_from_transfer(pending).unwrap());
+        resolve(&mut resolver, &mut state, ContextType::Default);
+        assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+        state.add_to_queue(state.player().track.as_ref().unwrap().clone(), true);
+        assert_eq!(state.player().track.uid, "q8");
+        let queued: Vec<_> = state
+            .player()
+            .next_tracks
+            .iter()
+            .filter(|t| t.is_queue())
+            .map(|t| t.uid.as_str())
+            .collect();
+        assert_eq!(queued, ["q3", "q9"]);
+    }
+
+    #[tokio::test]
+    async fn provider_only_autoplay_transfer_uses_autoplay_context() {
+        let (mut state, mut resolver, mut transfer) = fixture(false);
+        state.player_mut().track.mut_or_insert_default().provider = "autoplay".into();
+        resolve(&mut resolver, &mut state, ContextType::Autoplay);
+        assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+        assert!(transfer.is_none());
+        assert_eq!(state.active_context, ContextType::Autoplay);
+    }
+
+    #[tokio::test]
+    async fn failed_completion_keeps_state_and_transfer() {
+        let (mut state, mut resolver, mut transfer) = fixture(false);
+        resolve(&mut resolver, &mut state, ContextType::Default);
+        state.set_shuffle(true);
+        state.get_context_mut(ContextType::Default).unwrap().tracks = Vec::new().into();
+        let before = state.player().clone();
+        assert!(resolver.try_finish(&mut state, &mut transfer).is_err());
+        assert!(transfer.is_some());
+        assert_eq!(state.player(), &before);
+    }
+
+    #[tokio::test]
+    async fn missing_current_track_is_classified_from_transfer_metadata() {
+        let (mut state, mut resolver, mut transfer) = fixture(true);
+        state.player_mut().track = MessageField::none();
+        resolve(&mut resolver, &mut state, ContextType::Autoplay);
+        assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+        assert!(transfer.is_none());
+        assert_eq!(state.player().track.uid, "current");
+    }
+
+    #[tokio::test]
+    async fn queued_current_occurrence_is_not_imported_twice() {
+        let (mut state, mut resolver, mut transfer) = fixture(true);
+        let pending = transfer.as_mut().unwrap();
+        pending.queue.mut_or_insert_default().is_playing_queue = Some(true);
+        pending.queue.mut_or_insert_default().tracks[0]
+            .metadata
+            .insert("autoplay.is_autoplay".into(), "true".into());
+        pending
+            .queue
+            .mut_or_insert_default()
+            .tracks
+            .push(track("queued-next"));
+        pending.current_session.mut_or_insert_default().current_uid = Some("current".into());
+        state.set_track(state.current_track_from_transfer(pending).unwrap());
+        state.active_context = ContextType::Autoplay;
+        resolve(&mut resolver, &mut state, ContextType::Autoplay);
+        assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+        assert_eq!(state.player().track.uid, "queued");
+        assert!(state.player().track.is_queue());
+        assert_eq!(
+            state
+                .player()
+                .next_tracks
+                .iter()
+                .filter(|t| t.is_queue())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn autoplay_without_current_in_context_keeps_transferred_occurrence() {
+        let (mut state, mut resolver, mut transfer) = fixture(true);
+        let mut context = context();
+        for track in &mut context.pages[0].tracks {
+            track.uri = Some("spotify:track:7ouMYWpwJ422jRcDASZB7P".into());
+            track.uid = Some("future".into());
+        }
+        resolver.add(ResolveContext::from_uri(
+            URI,
+            URI,
+            ContextType::Autoplay,
+            ContextAction::Replace,
+        ));
+        resolver.apply_next_context(&mut state, context).unwrap();
+        assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+        assert_eq!(state.player().track.uid, "current");
+        assert_eq!(state.player().track.uri, URI);
+        assert_eq!(
+            state
+                .player()
+                .next_tracks
+                .iter()
+                .filter(|t| t.is_queue())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn autoplay_does_not_shuffle_unavailable_default_context() {
+        let (mut state, mut resolver, mut transfer) = fixture(true);
+        state.set_shuffle(true);
+        resolve(&mut resolver, &mut state, ContextType::Autoplay);
+        assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+        assert_eq!(state.player().track.uid, "current");
+        assert!(state.shuffling_context());
+    }
+
+    #[tokio::test]
+    async fn default_shuffle_preserves_queued_or_missing_current_occurrence() {
+        for queued in [false, true] {
+            let (mut state, mut resolver, mut transfer) = fixture(false);
+            state.set_shuffle(true);
+            state.player_mut().track.mut_or_insert_default().uid = "transferred".into();
+            state.player_mut().track.mut_or_insert_default().uri =
+                "spotify:track:7ouMYWpwJ422jRcDASZB7P".into();
+            if queued {
+                state.player_mut().track.mut_or_insert_default().provider = "queue".into();
+            }
+            resolve(&mut resolver, &mut state, ContextType::Default);
+            assert!(resolver.try_finish(&mut state, &mut transfer).unwrap());
+            assert_eq!(state.player().track.uid, "transferred");
+            assert_eq!(state.player().track.is_queue(), queued);
+        }
+    }
+
+    #[tokio::test]
+    async fn newer_transfer_replaces_previous_explicit_queue() {
+        let (mut state, _, mut transfer) = fixture(false);
+        state.add_to_queue(state.player().track.as_ref().unwrap().clone(), false);
+        assert_eq!(state.player().next_tracks.len(), 1);
+        state.handle_initial_transfer(transfer.as_mut().unwrap(), Some(URI.into()));
+        assert!(state.player().next_tracks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn required_request_bypasses_previous_unavailable_cache() {
+        let (_, mut resolver, _) = fixture(false);
+        let resolve =
+            ResolveContext::from_uri(URI, URI, ContextType::Default, ContextAction::Replace);
+        resolver.add(resolve.clone());
+        resolver.mark_next_unavailable();
+        resolver.remove_used_and_invalid();
+        resolver.add_required(resolve);
+        assert!(resolver.has_next());
+    }
+
+    #[tokio::test]
+    async fn retry_delay_survives_cancelled_polling_and_is_bounded() {
+        let (_, mut resolver, _) = fixture(false);
+        resolver.add_required(ResolveContext::from_uri(
+            URI,
+            URI,
+            ContextType::Default,
+            ContextAction::Replace,
+        ));
+        assert!(resolver.retry_next());
+        let deadline = resolver.retry_at;
+        for _ in 0..2 {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(1),
+                    resolver.get_next_context(Vec::new)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(resolver.retry_at, deadline);
+        }
+        assert!(!resolver.retry_next());
     }
 }

@@ -191,6 +191,7 @@ impl EventHandler {
                             PlayerEvent::SessionDisconnected {
                                 connection_id,
                                 user_name,
+                                ..
                             } => {
                                 env_vars.insert("PLAYER_EVENT", "session_disconnected".to_string());
                                 env_vars.insert("CONNECTION_ID", connection_id);

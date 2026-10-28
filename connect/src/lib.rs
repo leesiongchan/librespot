@@ -10,10 +10,14 @@ use librespot_protocol as protocol;
 
 mod context_resolver;
 mod model;
+mod queue;
+mod recovery;
 mod shuffle_vec;
 mod spirc;
+mod startup;
 mod state;
 
 pub use model::*;
+pub use recovery::{RecoveryCheckpoint, RecoveryIdentity, StartupMode};
 pub use spirc::*;
 pub use state::*;

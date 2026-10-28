@@ -15,13 +15,13 @@ use crate::{
     },
 };
 use protobuf::MessageField;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 const LOCAL_FILES_IDENTIFIER: &str = "spotify:local-files";
 const SEARCH_IDENTIFIER: &str = "spotify:search";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StateContext {
     pub tracks: ShuffleVec<ProvidedTrack>,
     pub metadata: HashMap<String, String>,
@@ -35,6 +35,16 @@ pub enum ContextType {
     #[default]
     Default,
     Autoplay,
+}
+
+impl ContextType {
+    pub(crate) fn for_track(track: &ProvidedTrack) -> Self {
+        if track.is_autoplay() || track.is_from_autoplay() {
+            Self::Autoplay
+        } else {
+            Self::Default
+        }
+    }
 }
 
 pub enum ResetContext<'s> {
@@ -101,6 +111,7 @@ impl ConnectState {
     }
 
     pub fn reset_context(&mut self, mut reset_as: ResetContext) {
+        self.preserve_recovery_queue = false;
         if matches!(reset_as, ResetContext::WhenDifferent(ctx) if self.different_context_uri(ctx)) {
             reset_as = ResetContext::Completely
         }
@@ -398,16 +409,47 @@ impl ConnectState {
 
     pub fn merge_context(&mut self, new_page: Option<ContextPage>) -> Option<()> {
         let current_context = self.get_context_mut(ContextType::Default).ok()?;
+        let new_page = new_page?;
+        let incoming_uids: HashSet<_> = new_page
+            .tracks
+            .iter()
+            .filter_map(|track| track.uid.as_ref().filter(|uid| !uid.is_empty()))
+            .cloned()
+            .collect();
+        let mut matched = HashSet::new();
 
-        for new_track in new_page?.tracks {
+        for new_track in new_page.tracks {
             if new_track.uri.is_none() || matches!(new_track.uri, Some(ref uri) if uri.is_empty()) {
                 continue;
             }
 
             let new_track_uri = new_track.uri.unwrap_or_default();
-            if let Ok(position) =
-                Self::find_index_in_context(current_context, |t| t.uri == new_track_uri)
-            {
+            let position = current_context
+                .tracks
+                .iter()
+                .enumerate()
+                .position(|(index, track)| {
+                    !matched.contains(&index)
+                        && track.uri == new_track_uri
+                        && new_track
+                            .uid
+                            .as_ref()
+                            .is_some_and(|uid| !uid.is_empty() && track.uid == *uid)
+                })
+                .or_else(|| {
+                    current_context
+                        .tracks
+                        .iter()
+                        .enumerate()
+                        .position(|(index, track)| {
+                            !matched.contains(&index)
+                                && track.uri == new_track_uri
+                                && !incoming_uids.contains(&track.uid)
+                        })
+                });
+            if let Some(position) = position {
+                // Repeated URIs identify different occurrences; reserve known UIDs before ordered fallback.
+                matched.insert(position);
                 let context_track = current_context.tracks.get_mut(position)?;
 
                 for (key, value) in new_track.metadata {
@@ -415,10 +457,8 @@ impl ConnectState {
                 }
 
                 // the uid provided from another context might be actual uid of an item
-                if new_track.uid.is_some()
-                    || matches!(new_track.uid, Some(ref uid) if uid.is_empty())
-                {
-                    context_track.uid = new_track.uid.unwrap_or_default();
+                if let Some(uid) = new_track.uid.filter(|uid| !uid.is_empty()) {
+                    context_track.uid = uid;
                 }
             }
         }

@@ -66,7 +66,10 @@ impl Credentials {
         }
     }
 
-    #[expect(deprecated)]
+    #[allow(
+        deprecated,
+        reason = "AES 0.8 uses generic-array 0.14; deprecation depends on the resolved lockfile"
+    )]
     pub fn with_blob(
         username: impl Into<String>,
         encrypted_blob: impl AsRef<[u8]>,

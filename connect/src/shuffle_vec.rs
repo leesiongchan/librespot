@@ -150,49 +150,23 @@ mod test {
     fn test_shuffle_with_first() {
         const MAX_RANGE: usize = 200;
 
-        let (base_vec, seed) = base(0..MAX_RANGE);
-        let rand_first = rand::rng().random_range(0..MAX_RANGE);
-
-        let mut shuffled_with_first = base_vec.clone();
-        shuffled_with_first.shuffle_with_seed(seed, |i| i == &rand_first);
-
-        assert_eq!(
-            Some(&rand_first),
-            shuffled_with_first.first(),
-            "after shuffling the first is expected to be the given item"
-        );
-
+        let base_vec: ShuffleVec<_> = (0..MAX_RANGE).collect::<Vec<_>>().into();
+        let seed = 42;
         let mut shuffled_without_first = base_vec.clone();
         shuffled_without_first.shuffle_with_seed(seed, |_| false);
 
-        let mut switched_positions = Vec::with_capacity(2);
-        for (i, without_first_value) in shuffled_without_first.iter().enumerate() {
-            if without_first_value != &shuffled_with_first[i] {
-                switched_positions.push(i);
-            } else {
-                assert_eq!(
-                    without_first_value, &shuffled_with_first[i],
-                    "shuffling with the same seed has the same result"
-                );
-            }
+        for first_position in [0, MAX_RANGE - 1] {
+            let first = shuffled_without_first[first_position];
+            let mut shuffled_with_first = base_vec.clone();
+            shuffled_with_first.shuffle_with_seed(seed, |i| i == &first);
+
+            let mut expected = shuffled_without_first.clone();
+            expected.swap(0, first_position);
+
+            assert_eq!(
+                shuffled_with_first, expected,
+                "only the selected item and the first item should be swapped; selected position={first_position}"
+            );
         }
-
-        assert_eq!(
-            switched_positions.len(),
-            2,
-            "only the switched positions should be different"
-        );
-
-        assert_eq!(
-            shuffled_with_first[switched_positions[0]],
-            shuffled_without_first[switched_positions[1]],
-            "the switched values should be equal"
-        );
-
-        assert_eq!(
-            shuffled_with_first[switched_positions[1]],
-            shuffled_without_first[switched_positions[0]],
-            "the switched values should be equal"
-        )
     }
 }
