@@ -2013,8 +2013,6 @@ impl SpircTask {
             }
         };
 
-        self.handle_activate();
-
         let timestamp = self.now_ms();
         let state = &mut self.connect_state;
         state.handle_initial_transfer(&mut transfer, ctx_uri.clone());
@@ -2025,6 +2023,9 @@ impl SpircTask {
         } else {
             ContextType::Default
         };
+
+        // Activation announces playback options, so import the restored values first.
+        self.handle_activate();
 
         let position = transfer_position(&transfer.playback, timestamp);
 
@@ -2951,6 +2952,59 @@ mod recovery_tests {
             ty,
             ContextAction::Replace,
         ));
+    }
+
+    #[tokio::test]
+    async fn restored_session_announces_imported_shuffle_and_repeat_options() {
+        for shuffle in [false, true] {
+            for (context, track) in [(false, false), (true, false), (false, true)] {
+                let (mut task, mut output) = fixture(false);
+                task.startup_mode = crate::StartupMode::ColdLaunch;
+                task.connect_state.set_shuffle(!shuffle);
+                let mut transfer = TransferState::new();
+                transfer
+                    .current_session
+                    .mut_or_insert_default()
+                    .context
+                    .mut_or_insert_default()
+                    .uri = Some(task.connect_state.context_uri().clone());
+                let playback = transfer.playback.mut_or_insert_default();
+                playback.current_track.mut_or_insert_default().uri =
+                    Some(task.connect_state.current_track(|t| t.uri.clone()));
+                playback.is_paused = Some(true);
+                let options = transfer.options.mut_or_insert_default();
+                options.shuffling_context = Some(shuffle);
+                options.repeating_context = Some(context);
+                options.repeating_track = Some(track);
+
+                assert!(task.restore_session(transfer));
+                assert_eq!(task.connect_state.shuffling_context(), shuffle);
+                assert_eq!(task.connect_state.repeat_context(), context);
+                assert_eq!(task.connect_state.repeat_track(), track);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    let mut announced_shuffle = None;
+                    while let Some(event) = output.recv().await {
+                        match event {
+                            PlayerEvent::ShuffleChanged { shuffle } => {
+                                announced_shuffle = Some(shuffle)
+                            }
+                            PlayerEvent::RepeatChanged {
+                                context: actual_context,
+                                track: actual_track,
+                            } => {
+                                assert_eq!(announced_shuffle, Some(shuffle));
+                                assert_eq!((actual_context, actual_track), (context, track));
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    panic!("missing restored playback options");
+                })
+                .await
+                .unwrap();
+            }
+        }
     }
 
     #[tokio::test]
