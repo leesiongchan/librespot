@@ -31,6 +31,8 @@ pub struct Error {
 pub enum AuthenticationFailure {
     InvalidCredentials,
     PremiumRequired,
+    /// Spotify will not let this account sign in here, and retrying cannot change that.
+    AccountRestricted,
 }
 
 impl Error {
@@ -44,6 +46,12 @@ impl Error {
                 ErrorCode::PremiumAccountRequired => Some(AuthenticationFailure::PremiumRequired),
                 ErrorCode::BadCredentials | ErrorCode::CouldNotValidateCredentials => {
                     Some(AuthenticationFailure::InvalidCredentials)
+                }
+                ErrorCode::TravelRestriction
+                | ErrorCode::ApplicationBanned
+                | ErrorCode::InvalidAppKey
+                | ErrorCode::ExtraVerificationRequired => {
+                    Some(AuthenticationFailure::AccountRestricted)
                 }
                 _ => None,
             };
@@ -536,5 +544,51 @@ impl From<Utf8Error> for Error {
 impl From<protobuf_json_mapping::ParseError> for Error {
     fn from(err: protobuf_json_mapping::ParseError) -> Self {
         Self::failed_precondition(err)
+    }
+}
+
+#[cfg(test)]
+mod authentication_failure_tests {
+    use super::*;
+    use crate::{connection::AuthenticationError, protocol::keyexchange::ErrorCode};
+
+    fn login_failure(code: ErrorCode) -> Option<AuthenticationFailure> {
+        Error::from(AuthenticationError::LoginFailed(code)).authentication_failure()
+    }
+
+    #[test]
+    fn login_failures_that_bar_the_account_are_restrictions() {
+        for code in [
+            ErrorCode::TravelRestriction,
+            ErrorCode::ApplicationBanned,
+            ErrorCode::InvalidAppKey,
+            ErrorCode::ExtraVerificationRequired,
+        ] {
+            assert_eq!(
+                login_failure(code),
+                Some(AuthenticationFailure::AccountRestricted),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_login_failures_are_not_authentication_failures() {
+        for code in [
+            ErrorCode::ProtocolError,
+            ErrorCode::TryAnotherAP,
+            ErrorCode::BadConnectionId,
+            ErrorCode::AccountExists,
+        ] {
+            assert_eq!(login_failure(code), None, "{code:?}");
+        }
+        assert_eq!(
+            login_failure(ErrorCode::PremiumAccountRequired),
+            Some(AuthenticationFailure::PremiumRequired)
+        );
+        assert_eq!(
+            login_failure(ErrorCode::BadCredentials),
+            Some(AuthenticationFailure::InvalidCredentials)
+        );
     }
 }
